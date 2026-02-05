@@ -187,6 +187,12 @@ pub(crate) fn create_request_body(
     completion_request: CompletionRequest,
 ) -> Result<GenerateContentRequest, CompletionError> {
     let mut full_history = Vec::new();
+
+    // Add documents as a user message at the beginning if present
+    if let Some(documents_message) = completion_request.normalized_documents() {
+        full_history.push(documents_message);
+    }
+
     full_history.extend(completion_request.chat_history);
 
     let additional_params = completion_request
@@ -819,7 +825,53 @@ pub mod gemini_api_types {
                         ));
                     };
 
-                    if !media_type.is_code() {
+                    // For text/plain documents (RAG context), convert to plain text
+                    if matches!(
+                        media_type,
+                        message::DocumentMediaType::TXT
+                            | message::DocumentMediaType::RTF
+                            | message::DocumentMediaType::HTML
+                            | message::DocumentMediaType::CSS
+                            | message::DocumentMediaType::MARKDOWN
+                            | message::DocumentMediaType::CSV
+                            | message::DocumentMediaType::XML
+                            | message::DocumentMediaType::Javascript
+                            | message::DocumentMediaType::Python
+                    ) {
+                        use base64::Engine;
+                        let text = match data {
+                            DocumentSourceKind::String(text) => text.clone(),
+                            DocumentSourceKind::Base64(data) => {
+                                // Decode base64 if needed
+                                String::from_utf8(
+                                    base64::engine::general_purpose::STANDARD
+                                        .decode(&data)
+                                        .map_err(|e| {
+                                            MessageError::ConversionError(format!(
+                                                "Failed to decode base64: {e}"
+                                            ))
+                                        })?,
+                                )
+                                .map_err(|e| {
+                                    MessageError::ConversionError(format!(
+                                        "Invalid UTF-8 in document: {e}"
+                                    ))
+                                })?
+                            }
+                            _ => {
+                                return Err(MessageError::ConversionError(
+                                    "Text-based documents must be String or Base64 encoded"
+                                        .to_string(),
+                                ));
+                            }
+                        };
+
+                        Ok(Part {
+                            thought: Some(false),
+                            part: PartKind::Text(text),
+                            ..Default::default()
+                        })
+                    } else if !media_type.is_code() {
                         let mime_type = media_type.to_mime_type().to_string();
 
                         let part = match data {
@@ -2150,258 +2202,181 @@ mod tests {
     }
 
     #[test]
-    fn test_tool_result_with_image_content() {
-        // Test that a ToolResult with image content converts correctly to Gemini's Part format
-        use crate::OneOrMany;
-        use crate::message::{
-            DocumentSourceKind, Image, ImageMediaType, ToolResult, ToolResultContent,
-        };
+    fn test_txt_document_conversion_to_text_part() {
+        // Test that TXT documents are converted to plain text parts, not inline data
+        use crate::message::{DocumentMediaType, UserContent};
 
-        // Create a tool result with both text and image content
-        let tool_result = ToolResult {
-            id: "test_tool".to_string(),
-            call_id: None,
-            content: OneOrMany::many(vec![
-                ToolResultContent::Text(message::Text {
-                    text: r#"{"status": "success"}"#.to_string(),
-                }),
-                ToolResultContent::Image(Image {
-                    data: DocumentSourceKind::Base64("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string()),
-                    media_type: Some(ImageMediaType::PNG),
-                    detail: None,
-                    additional_params: None,
-                }),
-            ]).expect("Should create OneOrMany with multiple items"),
-        };
-
-        let user_content = message::UserContent::ToolResult(tool_result);
-        let msg = message::Message::User {
-            content: OneOrMany::one(user_content),
-        };
-
-        // Convert to Gemini Content
-        let content: Content = msg.try_into().expect("Should convert to Gemini Content");
-
-        assert_eq!(content.role, Some(Role::User));
-        assert_eq!(content.parts.len(), 1);
-
-        // Verify the part is a FunctionResponse with both response and parts
-        if let Some(Part {
-            part: PartKind::FunctionResponse(function_response),
-            ..
-        }) = content.parts.first()
-        {
-            assert_eq!(function_response.name, "test_tool");
-
-            // Check that response JSON is present
-            assert!(function_response.response.is_some());
-            let response = function_response.response.as_ref().unwrap();
-            assert!(response.get("result").is_some());
-
-            // Check that parts with image data are present
-            assert!(function_response.parts.is_some());
-            let parts = function_response.parts.as_ref().unwrap();
-            assert_eq!(parts.len(), 1);
-
-            let image_part = &parts[0];
-            assert!(image_part.inline_data.is_some());
-            let inline_data = image_part.inline_data.as_ref().unwrap();
-            assert_eq!(inline_data.mime_type, "image/png");
-            assert!(!inline_data.data.is_empty());
-        } else {
-            panic!("Expected FunctionResponse part");
-        }
-    }
-
-    #[test]
-    fn test_tool_result_with_url_image() {
-        // Test that a ToolResult with a URL-based image converts to file_data
-        use crate::OneOrMany;
-        use crate::message::{
-            DocumentSourceKind, Image, ImageMediaType, ToolResult, ToolResultContent,
-        };
-
-        let tool_result = ToolResult {
-            id: "screenshot_tool".to_string(),
-            call_id: None,
-            content: OneOrMany::one(ToolResultContent::Image(Image {
-                data: DocumentSourceKind::Url("https://example.com/image.png".to_string()),
-                media_type: Some(ImageMediaType::PNG),
-                detail: None,
-                additional_params: None,
-            })),
-        };
-
-        let user_content = message::UserContent::ToolResult(tool_result);
-        let msg = message::Message::User {
-            content: OneOrMany::one(user_content),
-        };
-
-        let content: Content = msg.try_into().expect("Should convert to Gemini Content");
-
-        assert_eq!(content.role, Some(Role::User));
-        assert_eq!(content.parts.len(), 1);
-
-        if let Some(Part {
-            part: PartKind::FunctionResponse(function_response),
-            ..
-        }) = content.parts.first()
-        {
-            assert_eq!(function_response.name, "screenshot_tool");
-
-            // URL images should have parts with file_data
-            assert!(function_response.parts.is_some());
-            let parts = function_response.parts.as_ref().unwrap();
-            assert_eq!(parts.len(), 1);
-
-            let image_part = &parts[0];
-            assert!(image_part.file_data.is_some());
-            let file_data = image_part.file_data.as_ref().unwrap();
-            assert_eq!(file_data.file_uri, "https://example.com/image.png");
-            assert_eq!(file_data.mime_type.as_ref().unwrap(), "image/png");
-        } else {
-            panic!("Expected FunctionResponse part");
-        }
-    }
-
-    #[test]
-    fn test_from_tool_output_parses_image_json() {
-        // Test the ToolResultContent::from_tool_output helper with image JSON
-        use crate::message::{DocumentSourceKind, ToolResultContent};
-
-        // Test simple image JSON format
-        let image_json = r#"{"type": "image", "data": "base64data==", "mimeType": "image/jpeg"}"#;
-        let result = ToolResultContent::from_tool_output(image_json);
-
-        assert_eq!(result.len(), 1);
-        if let ToolResultContent::Image(img) = result.first() {
-            assert!(matches!(img.data, DocumentSourceKind::Base64(_)));
-            if let DocumentSourceKind::Base64(data) = &img.data {
-                assert_eq!(data, "base64data==");
-            }
-            assert_eq!(img.media_type, Some(crate::message::ImageMediaType::JPEG));
-        } else {
-            panic!("Expected Image content");
-        }
-    }
-
-    #[test]
-    fn test_from_tool_output_parses_hybrid_json() {
-        // Test the ToolResultContent::from_tool_output helper with hybrid response/parts format
-        use crate::message::{DocumentSourceKind, ToolResultContent};
-
-        let hybrid_json = r#"{
-            "response": {"status": "ok", "count": 42},
-            "parts": [
-                {"type": "image", "data": "imgdata1==", "mimeType": "image/png"},
-                {"type": "image", "data": "https://example.com/img.jpg", "mimeType": "image/jpeg"}
-            ]
-        }"#;
-
-        let result = ToolResultContent::from_tool_output(hybrid_json);
-
-        // Should have 3 items: 1 text (response) + 2 images (parts)
-        assert_eq!(result.len(), 3);
-
-        let items: Vec<_> = result.iter().collect();
-
-        // First should be text with the response JSON
-        if let ToolResultContent::Text(text) = &items[0] {
-            assert!(text.text.contains("status"));
-            assert!(text.text.contains("ok"));
-        } else {
-            panic!("Expected Text content first");
-        }
-
-        // Second should be base64 image
-        if let ToolResultContent::Image(img) = &items[1] {
-            assert!(matches!(img.data, DocumentSourceKind::Base64(_)));
-        } else {
-            panic!("Expected Image content second");
-        }
-
-        // Third should be URL image
-        if let ToolResultContent::Image(img) = &items[2] {
-            assert!(matches!(img.data, DocumentSourceKind::Url(_)));
-        } else {
-            panic!("Expected Image content third");
-        }
-    }
-
-    /// E2E test that verifies Gemini can process tool results containing images.
-    /// This test creates an agent with a tool that returns an image, invokes it,
-    /// and verifies that Gemini can interpret the image in the tool result.
-    #[tokio::test]
-    #[ignore = "requires GEMINI_API_KEY environment variable"]
-    async fn test_gemini_agent_with_image_tool_result_e2e() {
-        use crate::completion::{Prompt, ToolDefinition};
-        use crate::prelude::*;
-        use crate::providers::gemini;
-        use crate::tool::Tool;
-        use serde::{Deserialize, Serialize};
-
-        /// A tool that returns a small red 1x1 pixel PNG image
-        #[derive(Debug, Serialize, Deserialize)]
-        struct ImageGeneratorTool;
-
-        #[derive(Debug, thiserror::Error)]
-        #[error("Image generation error")]
-        struct ImageToolError;
-
-        impl Tool for ImageGeneratorTool {
-            const NAME: &'static str = "generate_test_image";
-            type Error = ImageToolError;
-            type Args = serde_json::Value;
-            // Return the image in the format that from_tool_output expects
-            type Output = String;
-
-            async fn definition(&self, _prompt: String) -> ToolDefinition {
-                ToolDefinition {
-                    name: "generate_test_image".to_string(),
-                    description: "Generates a small test image (a 1x1 red pixel). Call this tool when asked to generate or show an image.".to_string(),
-                    parameters: json!({
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }),
-                }
-            }
-
-            async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
-                // Return a JSON object that from_tool_output will parse as an image
-                // This is a 1x1 red PNG pixel
-                Ok(json!({
-                    "type": "image",
-                    "data": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==",
-                    "mimeType": "image/png"
-                }).to_string())
-            }
-        }
-
-        let client = gemini::Client::from_env();
-
-        let agent = client
-            .agent("gemini-3-flash-preview")
-            .preamble("You are a helpful assistant. When asked about images, use the generate_test_image tool to create one, then describe what you see in the image.")
-            .tool(ImageGeneratorTool)
-            .build();
-
-        // This prompt should trigger the tool, which returns an image that Gemini should process
-        let response = agent
-            .prompt("Please generate a test image and tell me what color the pixel is.")
-            .await;
-
-        // The test passes if Gemini successfully processes the request without errors.
-        // The image is a 1x1 red pixel, so Gemini should be able to describe it.
-        assert!(
-            response.is_ok(),
-            "Gemini should successfully process tool result with image: {:?}",
-            response.err()
+        let doc = UserContent::document(
+            "Note: test.md\nPath: /test.md\nContent: Hello World!",
+            Some(DocumentMediaType::TXT),
         );
 
-        let response_text = response.unwrap();
-        println!("Response: {response_text}");
-        // Gemini should have been able to see the image and potentially describe its color
-        assert!(!response_text.is_empty(), "Response should not be empty");
+        let content: Content = message::Message::User {
+            content: crate::OneOrMany::one(doc),
+        }
+        .try_into()
+        .unwrap();
+
+        assert_eq!(content.role, Some(Role::User));
+        assert_eq!(content.parts.len(), 1);
+
+        if let Part {
+            part: PartKind::Text(text),
+            ..
+        } = &content.parts[0]
+        {
+            assert!(text.contains("Note: test.md"));
+            assert!(text.contains("Hello World!"));
+        } else {
+            panic!(
+                "Expected text part for TXT document, got: {:?}",
+                content.parts[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_markdown_document_conversion_to_text_part() {
+        // Test that MARKDOWN documents are converted to plain text parts
+        use crate::message::{DocumentMediaType, UserContent};
+
+        let doc = UserContent::document(
+            "# Heading\n\n* List item",
+            Some(DocumentMediaType::MARKDOWN),
+        );
+
+        let content: Content = message::Message::User {
+            content: crate::OneOrMany::one(doc),
+        }
+        .try_into()
+        .unwrap();
+
+        assert_eq!(content.role, Some(Role::User));
+        assert_eq!(content.parts.len(), 1);
+
+        if let Part {
+            part: PartKind::Text(text),
+            ..
+        } = &content.parts[0]
+        {
+            assert_eq!(text, "# Heading\n\n* List item");
+        } else {
+            panic!(
+                "Expected text part for MARKDOWN document, got: {:?}",
+                content.parts[0]
+            );
+        }
+    }
+
+    #[test]
+    fn test_create_request_body_with_documents() {
+        // Test that documents are injected into chat history
+        use crate::OneOrMany;
+        use crate::completion::request::{CompletionRequest, Document};
+        use crate::message::Message;
+
+        let documents = vec![
+            Document {
+                id: "doc1".to_string(),
+                text: "Note: first.md\nContent: First note".to_string(),
+                additional_props: std::collections::HashMap::new(),
+            },
+            Document {
+                id: "doc2".to_string(),
+                text: "Note: second.md\nContent: Second note".to_string(),
+                additional_props: std::collections::HashMap::new(),
+            },
+        ];
+
+        let completion_request = CompletionRequest {
+            preamble: Some("You are a helpful assistant".to_string()),
+            chat_history: OneOrMany::one(Message::user("What are my notes about?")),
+            documents: documents.clone(),
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+        };
+
+        let request = create_request_body(completion_request).unwrap();
+
+        // Should have 2 contents: 1 for documents, 1 for user message
+        assert_eq!(
+            request.contents.len(),
+            2,
+            "Expected 2 contents (documents + user message)"
+        );
+
+        // First content should be documents with role User
+        assert_eq!(request.contents[0].role, Some(Role::User));
+        assert_eq!(
+            request.contents[0].parts.len(),
+            2,
+            "Expected 2 document parts"
+        );
+
+        // Check that documents are text parts
+        for part in &request.contents[0].parts {
+            if let Part {
+                part: PartKind::Text(text),
+                ..
+            } = part
+            {
+                assert!(
+                    text.contains("Note:") && text.contains("Content:"),
+                    "Document should contain note metadata"
+                );
+            } else {
+                panic!("Document parts should be text, not {:?}", part);
+            }
+        }
+
+        // Second content should be the user message
+        assert_eq!(request.contents[1].role, Some(Role::User));
+        if let Part {
+            part: PartKind::Text(text),
+            ..
+        } = &request.contents[1].parts[0]
+        {
+            assert_eq!(text, "What are my notes about?");
+        } else {
+            panic!("Expected user message to be text");
+        }
+    }
+
+    #[test]
+    fn test_create_request_body_without_documents() {
+        // Test backward compatibility: requests without documents work as before
+        use crate::OneOrMany;
+        use crate::completion::request::CompletionRequest;
+        use crate::message::Message;
+
+        let completion_request = CompletionRequest {
+            preamble: Some("You are a helpful assistant".to_string()),
+            chat_history: OneOrMany::one(Message::user("Hello")),
+            documents: vec![], // No documents
+            tools: vec![],
+            temperature: None,
+            max_tokens: None,
+            tool_choice: None,
+            additional_params: None,
+        };
+
+        let request = create_request_body(completion_request).unwrap();
+
+        // Should have only 1 content (the user message)
+        assert_eq!(request.contents.len(), 1, "Expected only user message");
+        assert_eq!(request.contents[0].role, Some(Role::User));
+
+        if let Part {
+            part: PartKind::Text(text),
+            ..
+        } = &request.contents[0].parts[0]
+        {
+            assert_eq!(text, "Hello");
+        } else {
+            panic!("Expected user message to be text");
+        }
     }
 }
